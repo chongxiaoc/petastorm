@@ -228,7 +228,6 @@ class BatchedRandomShufflingBuffer(BatchedShufflingBufferBase):
         self._done_adding = False
 
         self._random_indices = None
-        self.next_sample_head = 0
 
     def _add_many(self, items):
         if self._done_adding:
@@ -256,13 +255,7 @@ class BatchedRandomShufflingBuffer(BatchedShufflingBufferBase):
             for v in items:
                 self._items.append(torch.empty((new_capacity,) + v.shape[1:], dtype=v.dtype, device=v.device))
 
-        if self.next_sample_head > 0:
-            # Before we can append a new batch, we compress the remaining samples
-            for k, v in enumerate(self._items):
-                # We need to clone the right-side to avoid racing conditions
-                self._items[k][:self.size] = self._items[k][self._random_indices[self.next_sample_head:]].clone()
         self._random_indices = None
-        self.next_sample_head = 0
 
         if new_capacity > self._items[0].shape[0]:
             for k, v in enumerate(self._items):
@@ -282,12 +275,12 @@ class BatchedRandomShufflingBuffer(BatchedShufflingBufferBase):
 
         if self._random_indices is None:
             # We randomize the order of all samples ahead of time and then slice it into chunks with ```batch_size```
-            self.next_sample_head = 0
             self._random_indices = torch.randperm(int(self._size), device=self._items[0].device)
-        idx = self._random_indices[self.next_sample_head:self.next_sample_head + batch_size]
-        self.next_sample_head += batch_size
-        sample = [v[idx] for v in self._items]
+            self._items = [v[self._random_indices].clone() for v in self._items]
+
         self._size -= batch_size
+        sample = [v[self._size:self._size + batch_size] for v in self._items]
+
         return sample
 
     def can_add(self):
