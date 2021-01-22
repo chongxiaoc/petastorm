@@ -19,6 +19,8 @@ import re
 import sys
 import logging
 import numpy as np
+from queue import Queue, Empty
+from threading import Thread, Event
 from six import PY2
 from torch.utils.data.dataloader import default_collate
 import torch
@@ -265,6 +267,7 @@ class BatchedDataLoader(LoaderBase):
     def __init__(self, reader, batch_size=1,
                  transform_fn=None,
                  shuffling_queue_capacity=0,
+                 async_batch_queue_capacity=0,
                  inmemory_cache_all=False,
                  num_epochs=None):
         """
@@ -289,6 +292,10 @@ class BatchedDataLoader(LoaderBase):
         :param transform_fn: an optional callable to convert batches from the reader to PyTorch tensors
         :param shuffling_queue_capacity: Queue capacity is passed to the underlying :class:`tf.RandomShuffleQueue`
           instance. If set to 0, no shuffling will be done.
+        :param async_batch_queue_capacity: Number of batches to be produced in advance. If async_batch_queue_capacity
+            == 0, shuffle buffer will generate batches based on request. If async_batch_queue_capacity > 0, shuffle
+            work is done by an asynchronous thread to generate batches in advance. It is suggested to set this value
+            to be non-zero if shuffling is bottleneck for dataloader.
         :param inmemory_cache_all: This is an boolean that indicates whether the data should be
             cached in memory or not. When this cache is enabled, expect smaller than requested
             batch size on the epoch boundaries.
@@ -304,6 +311,7 @@ class BatchedDataLoader(LoaderBase):
         self._batch_acc = []
         self.shuffling_queue_capacity = shuffling_queue_capacity
         self._in_iter = None
+        self._async_batch_queue = None
 
         self.inmemory_cache_all = inmemory_cache_all
         self.num_epochs = num_epochs
@@ -318,6 +326,15 @@ class BatchedDataLoader(LoaderBase):
         if not self.inmemory_cache_all and self.num_epochs:
             raise ValueError("num_epochs should not be specified when inmemory_cache_all is "
                              "not enabled.")
+
+        if async_batch_queue_capacity > 0:
+            self._async_batch_queue = Queue(async_batch_queue_capacity)
+            self._finished_event = Event()
+            self._shuffle_thread = Thread(target=self._worker)
+            self._shuffle_thread.daemon = True
+            # Start async thread right away in init.
+            self._started = True
+            self._shuffle_thread.start()
 
     def _instantiate_buffers(self):
         if self.shuffling_queue_capacity > 0:
@@ -348,7 +365,38 @@ class BatchedDataLoader(LoaderBase):
 
         return shuffling_buffer, other_shuffling_buffer, instantiate_buffer_fn
 
+    def _worker(self):
+        for b in self._iter_impl_worker():
+            if self._finished_event.is_set():
+                break
+            self._async_batch_queue.put(b)
+        else:
+            self._async_batch_queue.put(None)
+
     def _iter_impl(self):
+        if self._async_batch_queue:
+            # Get shuffled batches from async shuffle thread
+            if not self._started:
+                # If reuse dataloader in a new pass, async shuffle thread has to be relaunched.
+                # It is finished in previous pass when reaching end of data.
+                self._shuffle_thread = Thread(target=self._worker)
+                self._shuffle_thread.daemon = True
+                self._started = True
+                self._shuffle_thread.start()
+            while True:
+                b = self._async_batch_queue.get()
+                if b is None:
+                    # None is last data in async batch queue, which means that async shuffle thread
+                    # has reached the end of data.
+                    self._started = False
+                    break
+                yield b
+        else:
+            # Sequentially shuffle data and produce batches in frontend.
+            for b in self._iter_impl_worker():
+                yield b
+
+    def _iter_impl_worker(self):
         """
         The Data Loader iterator stops the for-loop when reader runs out of samples.
         """
@@ -420,5 +468,19 @@ class BatchedDataLoader(LoaderBase):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._async_batch_queue:
+            # Close async shuffle thread
+            self._close_async_thread()
         self.reader.stop()
         self.reader.join()
+
+    def _close_async_thread(self):
+        self._finished_event.set()
+        try:
+            # Free some space in the queue to allow async shuffle thread not to
+            # be blocked in queue.put().
+            self._async_batch_queue.get_nowait()
+        except Empty:
+            pass
+        self._shuffle_thread.join()
+        self._started = False
