@@ -72,11 +72,21 @@ def test_simple_read(synthetic_dataset, reader_factory):
         _check_simple_reader(loader, synthetic_dataset.data, BATCHABLE_FIELDS - {TestSchema.sensor_name})
 
 
+@pytest.mark.parametrize('shuffling_queue_capacity', [0, 20])
 @pytest.mark.parametrize('reader_factory', ALL_READER_FLAVOR_FACTORIES)
-def test_simple_read_batched(synthetic_dataset, reader_factory):
+@pytest.mark.parametrize('async_batch_queue_capacity', [0, 5, 10])
+def test_simple_read_batched(synthetic_dataset, reader_factory,
+                             shuffling_queue_capacity,
+                             async_batch_queue_capacity):
+    num_epochs = 3
+    extra_loader_params = dict(shuffling_queue_capacity=shuffling_queue_capacity,
+                               async_batch_queue_capacity=async_batch_queue_capacity)
     with BatchedDataLoader(reader_factory(synthetic_dataset.url, schema_fields=TORCH_BATCHABLE_FIELDS,
-                                          transform_spec=TransformSpec(_sensor_name_to_int))) as loader:
-        _check_simple_reader(loader, synthetic_dataset.data, TORCH_BATCHABLE_FIELDS - {TestSchema.sensor_name})
+                                          transform_spec=TransformSpec(_sensor_name_to_int)),
+                           **extra_loader_params) as loader:
+        for _ in range(num_epochs):
+            # Check if dataloder works correctly with multiple passes.
+            _check_simple_reader(loader, synthetic_dataset.data, TORCH_BATCHABLE_FIELDS - {TestSchema.sensor_name})
 
 
 def test_sanitize_pytorch_types_int8():
@@ -230,12 +240,15 @@ def test_mem_cache_num_epochs_without_mem_cache_error(two_columns_non_petastorm_
 @pytest.mark.parametrize('shuffling_queue_capacity', [20, 0])
 @pytest.mark.parametrize('reader_factory', [make_batch_reader, make_reader])
 @pytest.mark.parametrize('num_epochs', [1, 2, 3, None])
+@pytest.mark.parametrize('async_batch_queue_capacity', [0, 2, 4])
 def test_batched_data_loader_with_in_memory_cache(two_columns_non_petastorm_dataset,
                                                   shuffling_queue_capacity,
                                                   reader_factory,
-                                                  num_epochs):
+                                                  num_epochs,
+                                                  async_batch_queue_capacity):
     batch_size = 10
-    extra_loader_params = dict(inmemory_cache_all=True, num_epochs=num_epochs)
+    extra_loader_params = dict(inmemory_cache_all=True, num_epochs=num_epochs,
+                               async_batch_queue_capacity=async_batch_queue_capacity)
     extra_reader_params = dict(num_epochs=1)
 
     with reader_factory(two_columns_non_petastorm_dataset.url,

@@ -6,6 +6,7 @@ Release notes
 
 Release 0.9.9 (unreleased)
 ==========================
+- `PR 641 <https://github.com/uber/petastorm/pull/641>`_: Enable async shuffle for PyTorch BatchedDataLoader.
 
 
 Release 0.9.8
